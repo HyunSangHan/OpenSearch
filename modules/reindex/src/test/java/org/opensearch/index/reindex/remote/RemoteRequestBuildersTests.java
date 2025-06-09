@@ -45,8 +45,14 @@ import org.opensearch.test.OpenSearchTestCase;
 
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.util.Map;
+
+import org.opensearch.search.sort.FieldSortBuilder;
+import org.opensearch.search.sort.SortBuilder;
+import org.opensearch.search.sort.SortOrder;
 
 import static org.opensearch.common.unit.TimeValue.timeValueMillis;
 import static org.opensearch.index.reindex.remote.RemoteRequestBuilders.DEPRECATED_URL_ENCODED_INDEX_WARNING;
@@ -61,6 +67,8 @@ import static org.hamcrest.Matchers.endsWith;
 import static org.hamcrest.Matchers.hasEntry;
 import static org.hamcrest.Matchers.hasKey;
 import static org.hamcrest.Matchers.not;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 /**
  * Tests for {@link RemoteRequestBuilders} which builds requests for remote version of
@@ -309,5 +317,229 @@ public class RemoteRequestBuildersTests extends OpenSearchTestCase {
         assertEquals(ContentType.TEXT_PLAIN.toString(), request.getEntity().getContentType());
         assertEquals(scroll, Streams.copyToString(new InputStreamReader(request.getEntity().getContent(), StandardCharsets.UTF_8)));
         assertThat(request.getParameters().keySet(), empty());
+    }
+
+    /**
+     * Test edge cases for scan vs sort logic to cover missing branches.
+     */
+    public void testScanVsSortEdgeCases() {
+        BytesReference query = new BytesArray("{}");
+        SearchRequest searchRequest = new SearchRequest().source(new SearchSourceBuilder());
+        
+        // Test multiple sorts with _doc for old version (should use scan)
+        RemoteVersion oldVersion = RemoteVersion.V_2_0_0;
+        searchRequest.source().sort("_doc").sort("_id");
+        Map<String, String> params = initialSearch(searchRequest, query, oldVersion).getParameters();
+        assertEquals("scan", params.get("search_type"));
+        
+        // Test non-_doc sort for old version (should not use scan)
+        searchRequest = new SearchRequest().source(new SearchSourceBuilder());
+        searchRequest.source().sort("timestamp");
+        params = initialSearch(searchRequest, query, oldVersion).getParameters();
+        assertThat(params, not(hasKey("search_type")));
+        assertEquals("timestamp:asc", params.get("sort"));
+    }
+
+    /**
+     * Test all version comparison branches in RemoteRequestBuilders to achieve full coverage
+     */
+    public void testVersionBranchesComprehensive() {
+        BytesReference query = new BytesArray("{}");
+        SearchRequest searchRequest = new SearchRequest().source(new SearchSourceBuilder());
+        
+        // Test remoteVersion.before(RemoteVersion.V_5_0_0) - TRUE branch
+        RemoteVersion beforeV5 = RemoteVersion.V_2_0_0;
+        TimeValue timeWithNanos = TimeValue.timeValueNanos(1500999L);
+        Map<String, String> params = scroll("scrollId", timeWithNanos, beforeV5).getParameters();
+        assertThat(params.get("scroll"), not(endsWith("nanos")));
+        
+        // Test remoteVersion.before(RemoteVersion.V_5_0_0) - FALSE branch 
+        RemoteVersion afterV5 = RemoteVersion.V_6_0_0;
+        params = scroll("scrollId", timeWithNanos, afterV5).getParameters();
+        // For newer versions, nanos should be preserved
+        
+        // Test remoteVersion.before(RemoteVersion.V_2_1_0) with FieldSortBuilder - TRUE branch
+        RemoteVersion beforeV2_1 = RemoteVersion.V_2_0_0;
+        searchRequest = new SearchRequest().source(new SearchSourceBuilder());
+        searchRequest.source().sort("_doc"); // This creates a FieldSortBuilder
+        params = initialSearch(searchRequest, query, beforeV2_1).getParameters();
+        assertEquals("scan", params.get("search_type"));
+        
+        // Test remoteVersion.before(RemoteVersion.V_2_1_0) with FieldSortBuilder - FALSE branch
+        RemoteVersion afterV2_1 = RemoteVersion.V_2_3_3;
+        searchRequest = new SearchRequest().source(new SearchSourceBuilder());
+        searchRequest.source().sort("_doc");
+        params = initialSearch(searchRequest, query, afterV2_1).getParameters();
+        assertEquals("_doc:asc", params.get("sort"));
+        assertThat(params, not(hasKey("search_type")));
+        
+        // Test remoteVersion.before(RemoteVersion.V_1_0_0) - TRUE branch
+        RemoteVersion beforeV1 = RemoteVersion.V_0_90_13;
+        searchRequest = new SearchRequest().source(new SearchSourceBuilder());
+        searchRequest.source().storedField("_id");
+        params = initialSearch(searchRequest, query, beforeV1).getParameters();
+        // For very old versions, _source should be automatically added
+        assertThat(params.get("fields"), containsString("_source"));
+        assertThat(params.get("fields"), containsString("_id"));
+        
+        // Test remoteVersion.before(RemoteVersion.V_1_0_0) - FALSE branch
+        RemoteVersion afterV1 = RemoteVersion.V_1_7_5;
+        searchRequest = new SearchRequest().source(new SearchSourceBuilder());
+        searchRequest.source().storedField("_id");
+        params = initialSearch(searchRequest, query, afterV1).getParameters();
+        // For newer versions, extra fields are still added but not _source automatically
+        assertThat(params.get("fields"), containsString("_id"));
+    }
+
+    /**
+     * Test FieldSortBuilder instanceof check coverage
+     */
+    public void testFieldSortBuilderInstanceCheck() {
+        BytesReference query = new BytesArray("{}");
+        SearchRequest searchRequest = new SearchRequest().source(new SearchSourceBuilder());
+        RemoteVersion oldVersion = RemoteVersion.V_2_0_0;
+        
+        // Test with FieldSortBuilder (instanceof should be true)
+        searchRequest.source().sort("_doc"); // Creates FieldSortBuilder
+        Map<String, String> params = initialSearch(searchRequest, query, oldVersion).getParameters();
+        assertEquals("scan", params.get("search_type"));
+        
+        // Test with non-FieldSortBuilder sort (we need to create a different type of sort)
+        searchRequest = new SearchRequest().source(new SearchSourceBuilder());
+        // Note: Most sorts in practice are FieldSortBuilder, but we can test the instance check
+        // by ensuring the branch is covered when there are no sorts or different sort types
+        
+        // Test with no sorts at all
+        params = initialSearch(searchRequest, query, oldVersion).getParameters();
+        assertThat(params, not(hasKey("search_type")));
+        
+        // Test with multiple field sorts to ensure all are checked
+        searchRequest = new SearchRequest().source(new SearchSourceBuilder());
+        searchRequest.source().sort("field1").sort("field2").sort("_doc");
+        params = initialSearch(searchRequest, query, oldVersion).getParameters();
+        assertEquals("scan", params.get("search_type"));
+    }
+
+    /**
+     * Test comprehensive time value conversion scenarios
+     */
+    public void testTimeValueConversionEdgeCases() {
+        String scroll = "test-scroll-id";
+        
+        // Test boundary conditions for version checks
+        RemoteVersion exactlyV5 = RemoteVersion.V_5_0_0;
+        TimeValue nanoTime = TimeValue.timeValueNanos(999999L); // Less than 1ms
+        Map<String, String> params = scroll(scroll, nanoTime, exactlyV5).getParameters();
+        // V_5_0_0 should NOT convert (false branch of before(V_5_0_0))
+        
+        RemoteVersion justBeforeV5 = RemoteVersion.V_2_3_3;
+        params = scroll(scroll, nanoTime, justBeforeV5).getParameters();
+        // Should convert nanos to millis and round up
+        assertThat(params.get("scroll"), not(endsWith("nanos")));
+        
+        // Test with micros ending string
+        TimeValue timeWithMicrosInName = TimeValue.timeValueNanos(1500L); // Very small nano value
+        params = scroll(scroll, timeWithMicrosInName, justBeforeV5).getParameters();
+        assertThat(params.get("scroll"), not(endsWith("micros")));
+        assertThat(params.get("scroll"), not(endsWith("nanos")));
+    }
+
+    /**
+     * Test sortToUri method's instanceof FieldSortBuilder check and exception handling
+     */
+    public void testSortToUriFieldSortBuilderCheck() {
+        // Test that FieldSortBuilder is handled correctly (TRUE branch of instanceof)
+        FieldSortBuilder fieldSort = new FieldSortBuilder("test_field").order(SortOrder.DESC);
+        
+        // Use reflection to test the private sortToUri method
+        try {
+            Method sortToUriMethod = RemoteRequestBuilders.class.getDeclaredMethod("sortToUri", SortBuilder.class);
+            sortToUriMethod.setAccessible(true);
+            
+            String result = (String) sortToUriMethod.invoke(null, fieldSort);
+            assertEquals("test_field:desc", result);
+            
+            // Test with ASC order as well
+            fieldSort = new FieldSortBuilder("another_field").order(SortOrder.ASC);
+            result = (String) sortToUriMethod.invoke(null, fieldSort);
+            assertEquals("another_field:asc", result);
+            
+            // Test the unsupported sort type (FALSE branch of instanceof)
+            // Create a mock SortBuilder that is not a FieldSortBuilder
+            SortBuilder<?> mockSort = mock(SortBuilder.class);
+            when(mockSort.toString()).thenReturn("UnsupportedSort");
+            
+            IllegalArgumentException exception = expectThrows(IllegalArgumentException.class, () -> {
+                try {
+                    sortToUriMethod.invoke(null, mockSort);
+                } catch (InvocationTargetException e) {
+                    throw (RuntimeException) e.getCause();
+                }
+            });
+            assertThat(exception.getMessage(), containsString("Unsupported sort"));
+            assertThat(exception.getMessage(), containsString("UnsupportedSort"));
+            
+        } catch (Exception e) {
+            fail("Failed to test sortToUri method: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Test comprehensive version branch coverage for all three identified branches
+     */
+    public void testSpecificVersionBranchCoverage() {
+        BytesReference query = new BytesArray("{}");
+        
+        // Test specific branch: remoteVersion.before(RemoteVersion.V_1_0_0) - TRUE
+        SearchRequest searchRequest = new SearchRequest().source(new SearchSourceBuilder());
+        searchRequest.source().storedField("test_field");
+        
+        RemoteVersion beforeV1 = RemoteVersion.V_0_90_13;
+        Map<String, String> params = initialSearch(searchRequest, query, beforeV1).getParameters();
+        
+        // For versions before 1.0.0, _source should be added as a stored field automatically
+        assertThat(params.get("fields"), containsString("_source"));
+        assertThat(params.get("fields"), containsString("test_field"));
+        
+        // Test specific branch: remoteVersion.before(RemoteVersion.V_1_0_0) - FALSE  
+        RemoteVersion afterV1 = RemoteVersion.V_1_0_0;
+        searchRequest = new SearchRequest().source(new SearchSourceBuilder());
+        
+        // For versions 1.0.0 and after, the entity should contain "_source": true
+        try {
+            Request request = initialSearch(searchRequest, query, afterV1);
+            HttpEntity entity = request.getEntity();
+            String entityContent = Streams.copyToString(new InputStreamReader(entity.getContent(), StandardCharsets.UTF_8));
+            assertThat(entityContent, containsString("\"_source\":true"));
+        } catch (IOException e) {
+            fail("Failed to read entity content: " + e.getMessage());
+        }
+        
+        // Test specific branch: remoteVersion.onOrAfter(RemoteVersion.V_1_0_0) - TRUE
+        RemoteVersion exactlyV1 = RemoteVersion.V_1_0_0;
+        searchRequest = new SearchRequest().source(new SearchSourceBuilder());
+        
+        try {
+            Request request = initialSearch(searchRequest, query, exactlyV1);
+            HttpEntity entity = request.getEntity();
+            String entityContent = Streams.copyToString(new InputStreamReader(entity.getContent(), StandardCharsets.UTF_8));
+            assertThat(entityContent, containsString("\"_source\":true"));
+        } catch (IOException e) {
+            fail("Failed to read entity content: " + e.getMessage());
+        }
+        
+        // Test specific branch: remoteVersion.onOrAfter(RemoteVersion.V_1_0_0) - FALSE
+        RemoteVersion beforeV1Again = RemoteVersion.V_0_90_13;
+        searchRequest = new SearchRequest().source(new SearchSourceBuilder());
+        
+        try {
+            Request request = initialSearch(searchRequest, query, beforeV1Again);
+            HttpEntity entity = request.getEntity();
+            String entityContent = Streams.copyToString(new InputStreamReader(entity.getContent(), StandardCharsets.UTF_8));
+            // For versions before 1.0.0, there should be no "_source":true in the entity
+            assertThat(entityContent, not(containsString("\"_source\":true")));
+        } catch (IOException e) {
+            fail("Failed to read entity content: " + e.getMessage());
+        }
     }
 }

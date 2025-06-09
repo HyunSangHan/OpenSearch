@@ -189,6 +189,55 @@ public class RemoteVersionTests extends OpenSearchTestCase {
         assertEquals(version1, version1);
     }
 
+    /**
+     * Comprehensive test for equals method to cover all branches
+     */
+    public void testEqualsMethodAllBranches() {
+        RemoteVersion baseVersion = new RemoteVersion(2, 1, 3, "elasticsearch");
+        
+        // Test same object (reflexivity)
+        assertEquals(baseVersion, baseVersion);
+        
+        // Test null
+        assertNotEquals(baseVersion, null);
+        
+        // Test different class
+        assertNotEquals(baseVersion, "not a version object");
+        
+        // Test different major version
+        RemoteVersion differentMajor = new RemoteVersion(1, 1, 3, "elasticsearch");
+        assertNotEquals(baseVersion, differentMajor);
+        
+        // Test different minor version
+        RemoteVersion differentMinor = new RemoteVersion(2, 0, 3, "elasticsearch");
+        assertNotEquals(baseVersion, differentMinor);
+        
+        // Test different revision
+        RemoteVersion differentRevision = new RemoteVersion(2, 1, 2, "elasticsearch");
+        assertNotEquals(baseVersion, differentRevision);
+        
+        // Test different distribution (null vs non-null) - null becomes "elasticsearch", so they are equal
+        RemoteVersion nullDistribution = new RemoteVersion(2, 1, 3, null);
+        assertEquals(baseVersion, nullDistribution); // null distribution becomes "elasticsearch"
+        
+        // Test different distribution (non-null vs non-null)
+        RemoteVersion opensearchDistribution = new RemoteVersion(2, 1, 3, "opensearch");
+        assertNotEquals(baseVersion, opensearchDistribution);
+        
+        // Test same distribution (both null)
+        RemoteVersion nullDist1 = new RemoteVersion(2, 1, 3, null);
+        RemoteVersion nullDist2 = new RemoteVersion(2, 1, 3, null);
+        assertEquals(nullDist1, nullDist2);
+        
+        // Test identical version (all fields match)
+        RemoteVersion identical = new RemoteVersion(2, 1, 3, "elasticsearch");
+        assertEquals(baseVersion, identical);
+        
+        // Test case sensitivity in distribution - both become lowercase, so they are equal
+        RemoteVersion upperCaseDist = new RemoteVersion(2, 1, 3, "ELASTICSEARCH");
+        assertEquals(baseVersion, upperCaseDist); // Both become "elasticsearch" due to toLowerCase()
+    }
+
     public void testToString() {
         RemoteVersion version = new RemoteVersion(2, 1, 3, null);
         assertEquals("2.1.3", version.toString());
